@@ -1,0 +1,27 @@
+﻿# --- Terraform ---
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+.terraformrc
+terraform.rc
+
+# Commit ONLY terraform/.terraform.lock.hcl (Terraform runs from /terraform)
+**/.terraform.lock.hcl
+!terraform/.terraform.lock.hcl
+
+# Plan files
+*.tfplan
+*.tfplan.*
+
+# --- Build artifacts ---
+terraform/lambda/*.zip
+
+# --- Local / misc ---
+out.json
+.vscode/
+.env
+.DS_Store
+Thumbs.db

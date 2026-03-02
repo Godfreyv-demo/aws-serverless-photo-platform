@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Photo App MVP (Cognito)</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 980px; margin: 40px auto; padding: 0 16px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    button { padding:10px 14px; cursor:pointer; }
+    input[type="file"] { padding: 8px; }
+    .status { margin-top: 12px; white-space: pre-wrap; }
+    .grid { margin-top: 20px; display:grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap:12px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:10px; }
+    img { width:100%; height:180px; object-fit:cover; border-radius:8px; }
+    .meta { font-size:12px; color:#555; margin-top:8px; word-break:break-word; }
+    code { background:#f6f6f6; padding:2px 4px; border-radius:4px; }
+    .pill { display:inline-block; padding:4px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>Photo App MVP (Cognito)</h1>
+
+  <div class="row" style="margin-bottom:10px;">
+    <button id="loginBtn">Login / Sign up</button>
+    <button id="logoutBtn">Logout</button>
+    <span class="pill" id="whoami">Not logged in</span>
+  </div>
+
+  <div class="row">
+    <input id="file" type="file" accept="image/*" />
+    <button id="uploadBtn">Upload</button>
+    <button id="refreshBtn">Refresh Gallery</button>
+  </div>
+
+  <div class="status" id="status"></div>
+  <div class="grid" id="grid"></div>
+
+<script>
+  // ---- Your deployed values ----
+  const API_BASE   = "https://ora18p6em5.execute-api.eu-west-2.amazonaws.com";
+  const REGION     = "eu-west-2";
+  const CLIENT_ID  = "4psuap1h8ld2l4fqt5dio85frk";
+  const DOMAIN     = "photo-app-dv90gz";
+  const COGNITO_BASE = `https://${DOMAIN}.auth.${REGION}.amazoncognito.com`;
+
+  // IMPORTANT: Derive redirect URI from the exact page you're on.
+  // This avoids localhost vs 127.0.0.1 mismatches.
+  const REDIRECT_URI = window.location.origin + window.location.pathname;
+
+  const statusEl = document.getElementById("status");
+  const gridEl = document.getElementById("grid");
+  const fileEl = document.getElementById("file");
+  const whoEl = document.getElementById("whoami");
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  // ---- Token storage (session only) ----
+  const TOKENS_KEY = "photoapp_tokens";
+  function getTokens() {
+    try { return JSON.parse(sessionStorage.getItem(TOKENS_KEY) || "null"); } catch { return null; }
+  }
+  function setTokens(t) { sessionStorage.setItem(TOKENS_KEY, JSON.stringify(t)); }
+  function clearTokens() { sessionStorage.removeItem(TOKENS_KEY); }
+
+  function parseJwt(token) {
+    try {
+      const base64Url = token.split(".")[1];
+      const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+      const jsonPayload = decodeURIComponent(atob(base64).split("").map(c => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)).join(""));
+      return JSON.parse(jsonPayload);
+    } catch { return null; }
+  }
+
+  function authHeader() {
+    const t = getTokens();
+    if (!t?.id_token) return {};
+    return { "Authorization": `Bearer ${t.id_token}` };
+  }
+
+  // ---- PKCE helpers ----
+  function base64urlencode(a) {
+    return btoa(String.fromCharCode.apply(null, new Uint8Array(a)))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  async function sha256(plain) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(plain);
+    return await crypto.subtle.digest("SHA-256", data);
+  }
+
+  function randomString(len=64) {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let out = "";
+    const arr = new Uint8Array(len);
+    crypto.getRandomValues(arr);
+    for (let i=0; i<len; i++) out += chars[arr[i] % chars.length];
+    return out;
+  }
+
+  // ---- Login / Logout ----
+  async function login() {
+    const verifier = randomString(64);
+    const challenge = base64urlencode(await sha256(verifier));
+    sessionStorage.setItem("pkce_verifier", verifier);
+
+    const url = new URL(`${COGNITO_BASE}/oauth2/authorize`);
+    url.searchParams.set("client_id", CLIENT_ID);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("scope", "openid email profile");
+
+    // CRITICAL: must match Cognito callback_urls EXACTLY
+    url.searchParams.set("redirect_uri", REDIRECT_URI);
+
+    url.searchParams.set("code_challenge_method", "S256");
+    url.searchParams.set("code_challenge", challenge);
+
+    // Optional but helpful: state
+    url.searchParams.set("state", randomString(24));
+
+    window.location.href = url.toString();
+  }
+
+  function logout() {
+    clearTokens();
+    sessionStorage.removeItem("pkce_verifier");
+
+    const url = new URL(`${COGNITO_BASE}/logout`);
+    url.searchParams.set("client_id", CLIENT_ID);
+
+    // Cognito expects logout_uri; must be in logout_urls
+    url.searchParams.set("logout_uri", REDIRECT_URI);
+
+    window.location.href = url.toString();
+  }
+
+  async function exchangeCodeForTokens(code) {
+    const verifier = sessionStorage.getItem("pkce_verifier");
+    if (!verifier) throw new Error("Missing PKCE verifier. Try logging in again.");
+
+    const body = new URLSearchParams();
+    body.set("grant_type", "authorization_code");
+    body.set("client_id", CLIENT_ID);
+    body.set("code", code);
+
+    // Must be identical to authorize redirect_uri
+    body.set("redirect_uri", REDIRECT_URI);
+
+    body.set("code_verifier", verifier);
+
+    const r = await fetch(`${COGNITO_BASE}/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(`Token exchange failed: ${r.status}\n${text}`);
+    }
+
+    const tok = await r.json();
+    setTokens(tok);
+    sessionStorage.removeItem("pkce_verifier");
+    return tok;
+  }
+
+  function updateWhoAmI() {
+    const t = getTokens();
+    if (!t?.id_token) {
+      whoEl.textContent = "Not logged in";
+      return;
+    }
+    const claims = parseJwt(t.id_token);
+    const email = claims?.email || "(no email claim)";
+    whoEl.textContent = `Logged in: ${email}`;
+  }
+
+  // ---- API calls ----
+  async function apiFetch(url, options={}) {
+    const headers = { ...(options.headers || {}), ...authHeader() };
+    const r = await fetch(url, { ...options, headers });
+    if (r.status === 401) throw new Error("401 Unauthorized (you need to login)");
+    return r;
+  }
+
+  async function getUploadUrl(file) {
+    const ct = file.type || "image/jpeg";
+    const r = await apiFetch(`${API_BASE}/upload-url?contentType=${encodeURIComponent(ct)}&contentLength=${file.size}`);
+    if (!r.ok) throw new Error(`GET /upload-url failed: ${r.status}`);
+    return r.json();
+  }
+
+  async function uploadToS3(uploadUrl, file) {
+    const r = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+      body: file
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(`S3 upload failed: ${r.status}\n${text}`);
+    }
+  }
+
+  async function finalizeUpload(objectKey) {
+    const r = await apiFetch(`${API_BASE}/finalize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ objectKey })
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(`POST /finalize failed: ${r.status}\n${text}`);
+    }
+    return r.json();
+  }
+
+  async function listPhotos() {
+    const r = await apiFetch(`${API_BASE}/photos`);
+    if (!r.ok) throw new Error(`GET /photos failed: ${r.status}`);
+    const data = await r.json();
+    return data.items || [];
+  }
+
+  function render(items) {
+    gridEl.innerHTML = "";
+
+    items.forEach(item => {
+      const div = document.createElement("div");
+      div.className = "card";
+
+      const img = document.createElement("img");
+      img.src = item.viewUrl || "";
+      img.alt = item.objectKey || "photo";
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.innerHTML = `
+        <div><b>key</b>: <code>${item.objectKey || ""}</code></div>
+        <div><b>createdAt</b>: ${item.createdAt || ""}</div>
+        <div><b>sk</b>: <code>${item.sk || ""}</code></div>
+      `;
+
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "Delete";
+      delBtn.style.marginTop = "8px";
+
+      delBtn.addEventListener("click", async () => {
+        if (!item.sk) {
+          setStatus("Can't delete: missing sk on this item.");
+          return;
+        }
+        if (!confirm("Delete this photo?")) return;
+
+        try {
+          setStatus("Deleting photo...");
+          const r = await apiFetch(`${API_BASE}/photos`, {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sk: item.sk })
+          });
+
+          if (!r.ok) {
+            const text = await r.text().catch(() => "");
+            throw new Error(`DELETE /photos failed: ${r.status}\n${text}`);
+          }
+
+          setStatus("Deleted. Refreshing gallery...");
+          const updated = await listPhotos();
+          render(updated);
+          setStatus("Deleted.");
+        } catch (e) {
+          setStatus(String(e));
+        }
+      });
+
+      div.appendChild(img);
+      div.appendChild(meta);
+      div.appendChild(delBtn);
+      gridEl.appendChild(div);
+    });
+  }
+
+  document.getElementById("loginBtn").addEventListener("click", login);
+  document.getElementById("logoutBtn").addEventListener("click", logout);
+
+  document.getElementById("refreshBtn").addEventListener("click", async () => {
+    try {
+      setStatus("Loading photos...");
+      const items = await listPhotos();
+      render(items);
+      setStatus(`Loaded ${items.length} photo(s).`);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+
+  document.getElementById("uploadBtn").addEventListener("click", async () => {
+    const file = fileEl.files[0];
+    if (!file) return setStatus("Pick a file first.");
+
+    const allowed = ["image/jpeg", "image/png", "image/webp"];
+    if (file.type && !allowed.includes(file.type)) {
+      return setStatus(`Unsupported file type: ${file.type}. Use JPG, PNG, or WEBP.`);
+    }
+    if (file.size > 5 * 1024 * 1024) return setStatus("File too large. Max is 5MB.");
+
+    try {
+      setStatus("1) Getting upload URL...");
+      const { uploadUrl, objectKey } = await getUploadUrl(file);
+
+      setStatus("2) Uploading to S3...");
+      await uploadToS3(uploadUrl, file);
+
+      setStatus("3) Finalizing upload...");
+      const finalized = await finalizeUpload(objectKey);
+
+      setStatus("4) Refreshing gallery...");
+      const items = await listPhotos();
+      render(items);
+
+      setStatus(`Done. Finalized: ${finalized.objectKey}`);
+      fileEl.value = "";
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+
+  // ---- On load: handle callback ?code=... ----
+  (async () => {
+    try {
+      const url = new URL(window.location.href);
+      const code = url.searchParams.get("code");
+
+      if (code) {
+        setStatus("Completing login (exchanging code for tokens)...");
+        await exchangeCodeForTokens(code);
+
+        // Clean URL
+        url.searchParams.delete("code");
+        url.searchParams.delete("state");
+        window.history.replaceState({}, document.title, url.toString());
+
+        setStatus("Logged in. You can upload now.");
+      }
+
+      updateWhoAmI();
+
+      // Auto-load gallery if logged in
+      if (getTokens()?.id_token) {
+        const items = await listPhotos();
+        render(items);
+        setStatus(`Loaded ${items.length} photo(s).`);
+      }
+    } catch (e) {
+      setStatus(String(e));
+      updateWhoAmI();
+    }
+  })();
+</script>
+</body>
+</html>
