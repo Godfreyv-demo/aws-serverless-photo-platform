@@ -1,5 +1,6 @@
 terraform {
   required_version = ">= 1.4.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,6 +10,14 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.6"
     }
+  }
+
+  backend "s3" {
+    bucket         = "godfreyv-photo-app-tfstate"
+    key            = "photo-app/terraform.tfstate"
+    region         = "eu-west-2"
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
   }
 }
 
