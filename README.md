@@ -3,17 +3,11 @@
 
 
 !\[AWS](https://img.shields.io/badge/AWS-Serverless-orange?logo=amazonaws)
-
 !\[Terraform](https://img.shields.io/badge/IaC-Terraform-purple?logo=terraform)
-
 !\[Lambda](https://img.shields.io/badge/AWS-Lambda-yellow?logo=awslambda)
-
 !\[DynamoDB](https://img.shields.io/badge/AWS-DynamoDB-blue?logo=amazondynamodb)
-
 !\[Cognito](https://img.shields.io/badge/Auth-Amazon%20Cognito-red?logo=amazonaws)
-
 !\[API Gateway](https://img.shields.io/badge/AWS-API%20Gateway-green?logo=amazonaws)
-
 !\[CI/CD](https://img.shields.io/badge/CI/CD-GitHub%20Actions-black?logo=githubactions)
 
 
